@@ -29,9 +29,11 @@ import java.nio.ByteBuffer;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Application-context session owner. All observable state is confined to the main thread. */
@@ -41,6 +43,8 @@ final class CameraController implements Camera.CameraListener {
     interface MediaLibraryCallback {
         void onStarted();
         void onProgress(int loaded, int total);
+        /** Incremental snapshot of everything loaded so far; posted while scanning continues. */
+        default void onBatch(List<CameraMediaEntry> entries) { }
         void onLoaded(List<CameraMediaEntry> entries);
         void onError(String message);
     }
@@ -71,10 +75,17 @@ final class CameraController implements Camera.CameraListener {
     private static final String DOWNLOAD_CHANNEL_ID = "camera_downloads";
     private static final int DOWNLOAD_NOTIFICATION_ID = 3101;
 
+    /** Lower value runs first. Preview work jumps ahead of library scanning and downloads. */
+    private static final int PRIORITY_CONNECT = 0;
+    private static final int PRIORITY_PREVIEW = 1;
+    private static final int PRIORITY_LIBRARY = 3;
+    private static final int PRIORITY_DOWNLOAD = 4;
+
     private final Context context;
     private final UsbManager usb;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final AtomicLong ioSequence = new AtomicLong();
+    private final ThreadPoolExecutor io = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new PriorityBlockingQueue<>());
     private final String permissionAction;
     private final NotificationManager notifications;
 
@@ -210,7 +221,7 @@ final class CameraController implements Camera.CameraListener {
         message = "正在打开 PTP 会话…";
         notifyState();
         int token = ++generation;
-        io.execute(() -> {
+        submitIo(PRIORITY_CONNECT, () -> {
             UsbDeviceConnection connection = null;
             try {
                 UsbInterface intf = findInterface(device);
@@ -293,7 +304,7 @@ final class CameraController implements Camera.CameraListener {
             return;
         }
         final int token = ++libraryGeneration;
-        io.execute(() -> {
+        submitIo(PRIORITY_LIBRARY, () -> {
             post(callback::onStarted);
             try {
                 LinkedHashMap<Integer, String> storages = retrieveStoragesSync(token);
@@ -304,22 +315,46 @@ final class CameraController implements Camera.CameraListener {
                     Arrays.sort(values);
                     for (int i = values.length - 1; i >= 0; i--) handles.add(new HandleRef(values[i], entry.getKey(), entry.getValue()));
                 }
-                int total = handles.size();
-                int loaded = 0;
-                List<CameraMediaEntry> entries = new ArrayList<>();
-                for (HandleRef handle : handles) {
-                    if (!validLibraryToken(token)) return;
-                    CameraMediaEntry item = retrieveMediaInfoSync(token, handle);
-                    loaded++;
-                    if (item != null && isImageObject(item)) entries.add(item);
-                    int progressLoaded = loaded;
-                    post(() -> callback.onProgress(progressLoaded, total));
+                final int total = handles.size();
+                if (total == 0) {
+                    post(() -> callback.onLoaded(new ArrayList<>()));
+                    return;
                 }
-                entries.sort(Comparator
-                        .comparing((CameraMediaEntry entry) -> entry.captureDateTime(), Comparator.nullsLast(Comparator.reverseOrder()))
-                        .thenComparingInt(entry -> -entry.handle));
-                if (!validLibraryToken(token)) return;
-                post(() -> callback.onLoaded(entries));
+                // Scan in small chunks queued at library priority so thumbnail / preview
+                // requests (PRIORITY_PREVIEW) interleave between chunks: the grid fills in live.
+                final List<CameraMediaEntry> accumulated = Collections.synchronizedList(new ArrayList<>());
+                final AtomicBoolean failed = new AtomicBoolean(false);
+                final int chunkSize = 24;
+                for (int start = 0; start < total; start += chunkSize) {
+                    final int from = start;
+                    final int to = Math.min(total, start + chunkSize);
+                    final boolean lastChunk = to == total;
+                    submitIo(PRIORITY_LIBRARY, () -> {
+                        if (failed.get() || !validLibraryToken(token)) return;
+                        try {
+                            List<CameraMediaEntry> batch = new ArrayList<>();
+                            for (int i = from; i < to; i++) {
+                                if (!validLibraryToken(token)) return;
+                                CameraMediaEntry item = retrieveMediaInfoSync(token, handles.get(i));
+                                if (item != null && isImageObject(item)) batch.add(item);
+                                final int loaded = i + 1;
+                                post(() -> callback.onProgress(loaded, total));
+                            }
+                            accumulated.addAll(batch);
+                            post(() -> callback.onBatch(new ArrayList<>(accumulated)));
+                            if (lastChunk) {
+                                accumulated.sort(Comparator
+                                        .comparing((CameraMediaEntry entry) -> entry.captureDateTime(), Comparator.nullsLast(Comparator.reverseOrder()))
+                                        .thenComparingInt(entry -> -entry.handle));
+                                if (!validLibraryToken(token)) return;
+                                post(() -> callback.onLoaded(new ArrayList<>(accumulated)));
+                            }
+                        } catch (Exception e) {
+                            if (failed.compareAndSet(false, true) && validLibraryToken(token))
+                                post(() -> callback.onError(e.getMessage() == null ? "读取相机照片失败" : e.getMessage()));
+                        }
+                    });
+                }
             } catch (Exception e) {
                 if (!validLibraryToken(token)) return;
                 post(() -> callback.onError(e.getMessage() == null ? "读取相机照片失败" : e.getMessage()));
@@ -336,12 +371,13 @@ final class CameraController implements Camera.CameraListener {
         synchronized (thumbnailRequests) {
             if (!thumbnailRequests.add(entry.handle)) return;
         }
-        final int token = ++thumbnailGeneration;
-        io.execute(() -> {
+        submitIo(PRIORITY_PREVIEW, () -> {
             try {
                 if (!connected() || camera == null) throw new IllegalStateException("相机未连接");
                 Bitmap thumb = retrieveThumbnailSync(entry.handle);
-                if (token != thumbnailGeneration) return;
+                // No generation check here: prefetch enqueues many thumbnails at once and each
+                // one must reach its own callback, otherwise almost every tile stays blank.
+                if (thumb == null) throw new IllegalStateException("相机未返回缩略图");
                 entry.thumbnail = prepareThumbnail(thumb);
                 post(() -> callback.onLoaded(entry, entry.thumbnail));
             } catch (Exception e) {
@@ -358,7 +394,7 @@ final class CameraController implements Camera.CameraListener {
             post(() -> callback.onError(entry, "相机未连接"));
             return;
         }
-        io.execute(() -> {
+        submitIo(PRIORITY_PREVIEW, () -> {
             post(() -> callback.onStarted(entry));
             try {
                 DownloadedObject object = retrieveObjectSync(entry.handle, null);
@@ -395,7 +431,7 @@ final class CameraController implements Camera.CameraListener {
         long totalBytes = 0L;
         for (CameraMediaEntry entry : entries) totalBytes += Math.max(0, entry.sizeBytes);
         final long finalTotalBytes = totalBytes;
-        io.execute(() -> {
+        submitIo(PRIORITY_DOWNLOAD, () -> {
             updateDownloadNotification("准备下载", "共 " + entries.size() + " 个文件");
             post(() -> callback.onStarted(entries.size(), finalTotalBytes));
             int successCount = 0;
@@ -468,6 +504,13 @@ final class CameraController implements Camera.CameraListener {
             long finalCompletedBytes = completedBytes;
             post(() -> callback.onCompleted(finalSuccess, entries.size(), Math.max(finalCompletedBytes, finalTotalBytes), errors));
         });
+    }
+
+    /** Stops the in-flight transfer; the queued loop exits on its next file boundary. */
+    void cancelDownloads() {
+        ++downloadGeneration;
+        downloadActive = false;
+        cancelDownloadNotification();
     }
 
     void disconnect() {
@@ -716,6 +759,30 @@ final class CameraController implements Camera.CameraListener {
 
     private void notifyState() { if (observer != null) observer.onStateChanged(); }
     private void post(Runnable runnable) { main.post(runnable); }
+
+    /** Serialises camera work on one thread while letting urgent tasks jump the queue. */
+    private void submitIo(int priority, Runnable task) {
+        io.execute(new PriorityTask(priority, ioSequence.getAndIncrement(), task));
+    }
+
+    private static final class PriorityTask implements Runnable, Comparable<PriorityTask> {
+        private final int priority;
+        private final long sequence;
+        private final Runnable body;
+
+        PriorityTask(int priority, long sequence, Runnable body) {
+            this.priority = priority;
+            this.sequence = sequence;
+            this.body = body;
+        }
+
+        @Override public void run() { body.run(); }
+
+        @Override public int compareTo(PriorityTask other) {
+            int byPriority = Integer.compare(priority, other.priority);
+            return byPriority != 0 ? byPriority : Long.compare(sequence, other.sequence);
+        }
+    }
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= 26 && notifications.getNotificationChannel(DOWNLOAD_CHANNEL_ID) == null) {

@@ -45,21 +45,35 @@ public final class MainActivity extends Activity implements CameraController.Obs
 
     private FrameLayout screenRoot;
     private LinearLayout libraryOverlay;
-    private PreviewView libraryPreview;
-    private TextView libraryStatus, librarySelection, libraryMeta, libraryFolder;
+    private TextView libraryStatus, librarySelection, libraryFolder;
     private Button libraryRefresh, libraryClose, librarySelectAll, libraryClear, libraryDownloadSelected,
-            libraryDownloadCurrent, libraryLoadOriginal, libraryChooseFolder;
-    private ListView libraryList;
+            libraryChooseFolder;
+    private GridView libraryGrid;
     private MediaLibraryAdapter libraryAdapter;
     private final List<CameraMediaEntry> libraryEntries = new ArrayList<>();
     private final List<CameraAlbumItem> libraryItems = new ArrayList<>();
     private final Set<String> selectedAlbumIds = new LinkedHashSet<>();
     private final Set<Integer> pendingThumbnailHandles = new HashSet<>();
-    private CameraAlbumItem activeLibraryItem;
-    private Bitmap libraryLargePreview;
-    private int libraryLargePreviewHandle = -1;
+    private final Set<Integer> failedThumbnailHandles = new HashSet<>();
+    private int libraryMergeToken;
     private Uri downloadFolderUri;
     private ArrayList<String> pendingDownloadAlbumIds;
+    private String pendingDownloadTitle;
+
+    private FrameLayout viewerOverlay;
+    private PreviewView viewerPreview;
+    private TextView viewerTitle, viewerInfo;
+    private Button viewerClose, viewerJpeg, viewerRaw, viewerDownload, viewerPrev, viewerNext;
+    private CameraAlbumItem viewerItem;
+    private int viewerLargeHandle = -1;
+
+    private final List<DownloadTask> downloadTasks = new ArrayList<>();
+    private DownloadTask activeDownloadTask;
+    private int downloadTaskSeq;
+    private LinearLayout downloadOverlay, downloadList, downloadStrip;
+    private TextView downloadStripText;
+    private Button downloadQueueButton;
+    private ProgressBar downloadStripProgress;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -173,7 +187,7 @@ public final class MainActivity extends Activity implements CameraController.Obs
             controller.capture();
         });
         controls.addView(shutter, spaced(-1, dp(72), 16));
-        controls.addView(text("照片库支持按日期分组、JPEG+RAW 配对显示、后台批量下载与懒加载缩略图", 11, MUTED), spaced(-1, -2, 12));
+        controls.addView(text("照片库以网格实时加载，点击查看大图、长按下载原图，JPEG+RAW 自动配对", 11, MUTED), spaced(-1, -2, 12));
 
         if (wide) {
             LinearLayout.LayoutParams viewerParams = new LinearLayout.LayoutParams(0, -1, 1);
@@ -192,13 +206,18 @@ public final class MainActivity extends Activity implements CameraController.Obs
         libraryOverlay = buildLibraryOverlay();
         libraryOverlay.setVisibility(View.GONE);
         screenRoot.addView(libraryOverlay, new FrameLayout.LayoutParams(-1, -1));
+        viewerOverlay = buildViewerOverlay();
+        screenRoot.addView(viewerOverlay, new FrameLayout.LayoutParams(-1, -1));
+        downloadOverlay = buildDownloadOverlay();
+        downloadOverlay.setVisibility(View.GONE);
+        screenRoot.addView(downloadOverlay, new FrameLayout.LayoutParams(-1, -1));
         setContentView(screenRoot);
         workspaceRoot.requestApplyInsets();
     }
 
     private LinearLayout buildLibraryOverlay() {
         LinearLayout overlay = column();
-        overlay.setBackgroundColor(0xEE0B1118);
+        overlay.setBackgroundColor(0xF20B1118);
         overlay.setPadding(dp(16), dp(16), dp(16), dp(16));
 
         LinearLayout header = row();
@@ -213,18 +232,11 @@ public final class MainActivity extends Activity implements CameraController.Obs
 
         libraryStatus = text("从相机读取照片列表…", 12, MUTED);
         overlay.addView(libraryStatus, spaced(-1, -2, 10));
-        librarySelection = text("未选择照片", 12, MUTED);
+        librarySelection = text("点击查看大图 · 长按下载原图", 12, MUTED);
         overlay.addView(librarySelection, spaced(-1, -2, 4));
 
-        boolean wide = getResources().getConfiguration().screenWidthDp >= 720;
-        LinearLayout body = wide ? row() : column();
-
-        LinearLayout left = column();
-        left.setBackground(rounded(PANEL, 18));
-        left.setPadding(dp(12), dp(12), dp(12), dp(12));
-
         LinearLayout selectRow = row();
-        librarySelectAll = button("全选分组", false, v -> {
+        librarySelectAll = button("全选", false, v -> {
             selectedAlbumIds.clear();
             for (CameraAlbumItem item : libraryItems) selectedAlbumIds.add(item.id);
             updateLibrarySelectionUi();
@@ -233,95 +245,328 @@ public final class MainActivity extends Activity implements CameraController.Obs
             selectedAlbumIds.clear();
             updateLibrarySelectionUi();
         });
-        selectRow.addView(librarySelectAll, new LinearLayout.LayoutParams(0, dp(46), 1));
-        selectRow.addView(libraryClear, new LinearLayout.LayoutParams(0, dp(46), 1));
-        left.addView(selectRow);
+        selectRow.addView(librarySelectAll, new LinearLayout.LayoutParams(0, dp(44), 1));
+        selectRow.addView(libraryClear, new LinearLayout.LayoutParams(0, dp(44), 1));
+        overlay.addView(selectRow, spaced(-1, -2, 6));
 
-        libraryList = new ListView(this);
-        libraryList.setDividerHeight(dp(2));
-        libraryList.setCacheColorHint(0);
-        libraryList.setSelector(new ColorDrawable(0x2225A18E));
+        libraryGrid = new GridView(this);
+        int columns = Math.max(3, getResources().getConfiguration().screenWidthDp / 130);
+        libraryGrid.setNumColumns(columns);
+        libraryGrid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
+        libraryGrid.setHorizontalSpacing(dp(6));
+        libraryGrid.setVerticalSpacing(dp(6));
+        libraryGrid.setClipToPadding(false);
+        libraryGrid.setSelector(new ColorDrawable(0x2225A18E));
         libraryAdapter = new MediaLibraryAdapter(this);
-        libraryAdapter.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            Object tag = buttonView.getTag();
-            if (!(tag instanceof String id)) return;
-            if (isChecked) selectedAlbumIds.add(id); else selectedAlbumIds.remove(id);
-            updateLibrarySelectionUi();
-        });
         libraryAdapter.setThumbnailRequester(this::requestThumbnailForItem);
-        libraryList.setAdapter(libraryAdapter);
-        libraryList.setOnItemClickListener((parent, view, position, id) -> {
-            LibraryListRow row = libraryAdapter.rowAt(position);
-            if (row instanceof LibraryListRow.Item itemRow) setActiveLibraryItem(itemRow.albumItem, false);
-        });
-        libraryList.setOnItemLongClickListener((parent, view, position, id) -> {
-            LibraryListRow row = libraryAdapter.rowAt(position);
-            if (!(row instanceof LibraryListRow.Item itemRow)) return false;
-            if (selectedAlbumIds.contains(itemRow.albumItem.id)) selectedAlbumIds.remove(itemRow.albumItem.id);
-            else selectedAlbumIds.add(itemRow.albumItem.id);
-            updateLibrarySelectionUi();
+        libraryGrid.setAdapter(libraryAdapter);
+        libraryGrid.setOnItemClickListener((parent, view, position, id) -> showViewer(libraryAdapter.itemAt(position)));
+        libraryGrid.setOnItemLongClickListener((parent, view, position, id) -> {
+            showItemActions(libraryAdapter.itemAt(position));
             return true;
         });
-        libraryList.setOnScrollListener(new AbsListView.OnScrollListener() {
+        libraryGrid.setOnScrollListener(new AbsListView.OnScrollListener() {
             @Override public void onScrollStateChanged(AbsListView view, int scrollState) { }
             @Override public void onScroll(AbsListView view, int firstVisibleItem, int visibleItemCount, int totalItemCount) {
                 prefetchVisibleThumbnails(firstVisibleItem, visibleItemCount);
             }
         });
-        LinearLayout.LayoutParams listParams = wide ? new LinearLayout.LayoutParams(0, -1, 1) : new LinearLayout.LayoutParams(-1, dp(340));
-        listParams.topMargin = dp(10);
-        left.addView(libraryList, listParams);
-
-        LinearLayout right = column();
-        right.setBackground(rounded(PANEL, 18));
-        right.setPadding(dp(12), dp(12), dp(12), dp(12));
-        TextView previewLabel = text("预览 / 下载", 14, TEXT);
-        previewLabel.setTypeface(Typeface.DEFAULT_BOLD);
-        right.addView(previewLabel);
-
-        libraryPreview = new PreviewView(this);
-        libraryPreview.setReview(true);
-        libraryPreview.setPlaceholder("选择一组照片", "支持按天分组、JPEG+RAW 成组显示、查看原图/RAW 预览");
-        libraryPreview.setBackground(rounded(0xFF080C11, 18));
-        libraryPreview.setClipToOutline(true);
-        LinearLayout.LayoutParams previewParams = new LinearLayout.LayoutParams(-1, wide ? 0 : dp(260));
-        if (wide) previewParams.weight = 1f;
-        previewParams.topMargin = dp(10);
-        right.addView(libraryPreview, previewParams);
-        libraryMeta = text("尚未读取相机照片", 12, MUTED);
-        right.addView(libraryMeta, spaced(-1, -2, 10));
+        LinearLayout.LayoutParams gridParams = new LinearLayout.LayoutParams(-1, 0, 1);
+        gridParams.topMargin = dp(10);
+        overlay.addView(libraryGrid, gridParams);
 
         libraryFolder = text(downloadFolderUri == null ? "下载目录：未选择" : "下载目录：" + folderLabel(downloadFolderUri), 11, MUTED);
-        right.addView(libraryFolder, spaced(-1, -2, 8));
+        overlay.addView(libraryFolder, spaced(-1, -2, 10));
+
+        downloadStrip = column();
+        downloadStrip.setBackground(rounded(PANEL, 14));
+        downloadStrip.setPadding(dp(10), dp(8), dp(10), dp(10));
+        downloadStrip.setVisibility(View.GONE);
+        downloadStrip.setOnClickListener(v -> openDownloads());
+        downloadStripText = text("", 12, TEXT);
+        downloadStrip.addView(downloadStripText);
+        downloadStripProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        downloadStripProgress.setMax(100);
+        LinearLayout.LayoutParams stripProgressParams = new LinearLayout.LayoutParams(-1, dp(6));
+        stripProgressParams.topMargin = dp(6);
+        downloadStrip.addView(downloadStripProgress, stripProgressParams);
+        overlay.addView(downloadStrip, spaced(-1, -2, 8));
+
+        LinearLayout actions = row();
         libraryChooseFolder = button("选择下载目录", false, v -> pickDownloadFolder(null));
-        right.addView(libraryChooseFolder, spaced(-1, dp(48), 8));
+        downloadQueueButton = button("下载队列", false, v -> openDownloads());
+        actions.addView(libraryChooseFolder, new LinearLayout.LayoutParams(0, dp(48), 1));
+        actions.addView(downloadQueueButton, new LinearLayout.LayoutParams(0, dp(48), 1));
+        overlay.addView(actions, spaced(-1, -2, 6));
 
-        libraryLoadOriginal = button("查看原图 / RAW 预览", false, v -> promptPreviewChoice());
-        right.addView(libraryLoadOriginal, spaced(-1, dp(48), 8));
-
-        LinearLayout downloadRow = row();
-        libraryDownloadCurrent = button("下载当前分组", true, v -> {
-            if (activeLibraryItem != null) requestDownload(activeLibraryItem.assets);
-        });
-        libraryDownloadSelected = button("后台批量下载所选", true, v -> requestDownload(selectedEntries()));
-        downloadRow.addView(libraryDownloadCurrent, new LinearLayout.LayoutParams(0, dp(52), 1));
-        downloadRow.addView(libraryDownloadSelected, new LinearLayout.LayoutParams(0, dp(52), 1));
-        right.addView(downloadRow, spaced(-1, -2, 10));
-
-        if (wide) {
-            body.addView(left, new LinearLayout.LayoutParams(0, -1, 1));
-            LinearLayout.LayoutParams rightParams = new LinearLayout.LayoutParams(0, -1, 1);
-            rightParams.setMarginStart(dp(12));
-            body.addView(right, rightParams);
-            overlay.addView(body, new LinearLayout.LayoutParams(-1, 0, 1));
-        } else {
-            body.addView(left, new LinearLayout.LayoutParams(-1, -2));
-            LinearLayout.LayoutParams rightParams = new LinearLayout.LayoutParams(-1, -2);
-            rightParams.topMargin = dp(12);
-            body.addView(right, rightParams);
-            overlay.addView(scroll(body), new LinearLayout.LayoutParams(-1, 0, 1));
-        }
+        libraryDownloadSelected = button("后台批量下载所选", true, v -> requestDownload(selectedEntries(), selectedTitle()));
+        overlay.addView(libraryDownloadSelected, spaced(-1, dp(48), 8));
         return overlay;
+    }
+
+    /** Full-screen download queue with per-task progress. */
+    private LinearLayout buildDownloadOverlay() {
+        LinearLayout overlay = column();
+        overlay.setBackgroundColor(0xF20B1118);
+        overlay.setPadding(dp(16), dp(16), dp(16), dp(16));
+
+        LinearLayout header = row();
+        TextView title = text("下载任务", 20, TEXT);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        Button close = button("关闭", false, v -> downloadOverlay.setVisibility(View.GONE));
+        header.addView(close);
+        overlay.addView(header);
+
+        downloadList = column();
+        LinearLayout.LayoutParams listParams = new LinearLayout.LayoutParams(-1, 0, 1);
+        listParams.topMargin = dp(12);
+        overlay.addView(scroll(downloadList), listParams);
+
+        LinearLayout footer = row();
+        Button cancelCurrent = button("取消当前下载", false, v -> cancelCurrentDownload());
+        Button clearFinished = button("清空已完成", false, v -> {
+            downloadTasks.removeIf(DownloadTask::finished);
+            refreshDownloadUi();
+        });
+        footer.addView(cancelCurrent, new LinearLayout.LayoutParams(0, dp(48), 1));
+        footer.addView(clearFinished, new LinearLayout.LayoutParams(0, dp(48), 1));
+        overlay.addView(footer, spaced(-1, -2, 8));
+        return overlay;
+    }
+
+    private void openDownloads() {
+        downloadOverlay.setVisibility(View.VISIBLE);
+        refreshDownloadUi();
+    }
+
+    private void cancelCurrentDownload() {
+        if (activeDownloadTask != null) {
+            activeDownloadTask.state = DownloadTask.State.CANCELLED;
+            for (DownloadTask task : downloadTasks) {
+                if (task.state == DownloadTask.State.QUEUED) task.state = DownloadTask.State.CANCELLED;
+            }
+        }
+        controller.cancelDownloads();
+        activeDownloadTask = null;
+        refreshDownloadUi();
+        Toast.makeText(this, "已取消当前下载", Toast.LENGTH_SHORT).show();
+    }
+
+    /** Rebuilds the queue panel and the compact progress strip. */
+    private void refreshDownloadUi() {
+        if (downloadList == null) return;
+        int queued = 0;
+        int running = 0;
+        int finished = 0;
+        for (DownloadTask task : downloadTasks) {
+            if (task.state == DownloadTask.State.QUEUED) queued++;
+            else if (task.state == DownloadTask.State.RUNNING) running++;
+            else if (task.finished()) finished++;
+        }
+        if (downloadOverlay.getVisibility() == View.VISIBLE) renderDownloadList();
+        updateDownloadStrip(queued);
+        if (downloadQueueButton != null) {
+            boolean active = queued + running > 0;
+            downloadQueueButton.setText(active ? "下载队列 (" + (queued + running) + ")" : "下载队列");
+        }
+        if (finished > 0 && queued + running == 0 && libraryStatus != null && activeDownloadTask == null) {
+            libraryStatus.setText("下载队列已完成，共 " + finished + " 个任务");
+        }
+    }
+
+    private void renderDownloadList() {
+        downloadList.removeAllViews();
+        for (DownloadTask task : downloadTasks) {
+            LinearLayout card = column();
+            card.setBackground(rounded(PANEL, 14));
+            card.setPadding(dp(12), dp(10), dp(12), dp(12));
+            TextView name = text(task.title, 14, TEXT);
+            name.setTypeface(Typeface.DEFAULT_BOLD);
+            card.addView(name);
+            TextView status = text(task.statusText(), 11, task.state == DownloadTask.State.FAILED ? 0xFFE7A65A : MUTED);
+            card.addView(status, spaced(-1, -2, 4));
+            ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+            bar.setMax(100);
+            bar.setProgress(task.percent());
+            LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(-1, dp(6));
+            barParams.topMargin = dp(6);
+            card.addView(bar, barParams);
+            if (!task.errors.isEmpty()) {
+                TextView errors = text(String.join("\n", task.errors), 10, 0xFFE7A65A);
+                card.addView(errors, spaced(-1, -2, 6));
+            }
+            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(-1, -2);
+            cardParams.bottomMargin = dp(10);
+            downloadList.addView(card, cardParams);
+        }
+        if (downloadTasks.isEmpty()) {
+            downloadList.addView(text("暂无下载任务。长按照片可下载原图，或从照片库批量下载。", 12, MUTED), spaced(-1, -2, 8));
+        }
+    }
+
+    /** Compact always-visible progress bar on top of the gallery. */
+    private void updateDownloadStrip(int queued) {
+        downloadStrip.setVisibility(downloadTasks.isEmpty() ? View.GONE : View.VISIBLE);
+        if (downloadTasks.isEmpty()) return;
+        DownloadTask current = activeDownloadTask != null ? activeDownloadTask : downloadTasks.get(downloadTasks.size() - 1);
+        downloadStripText.setText(current.title + " · " + current.statusText()
+                + (queued > 0 ? " · 还有 " + queued + " 个任务排队" : ""));
+        downloadStripProgress.setProgress(current.percent());
+    }
+
+    /** Full-screen viewer: pinch zoom, auto loads the JPEG original, switches to RAW embedded preview. */
+    private FrameLayout buildViewerOverlay() {
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(0xFA05080C);
+
+        viewerPreview = new PreviewView(this);
+        viewerPreview.setReview(true);
+        viewerPreview.setPlaceholder("正在读取照片", "上下滑动切换 · 双指缩放 · 双击复位");
+        viewerPreview.setSwipeListener(next -> navigateViewer(next ? 1 : -1));
+        overlay.addView(viewerPreview, new FrameLayout.LayoutParams(-1, -1));
+
+        LinearLayout top = row();
+        top.setPadding(dp(16), dp(12), dp(8), dp(12));
+        top.setBackgroundColor(0x88000000);
+        viewerTitle = text("", 16, TEXT);
+        viewerTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        top.addView(viewerTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        viewerClose = button("关闭", false, v -> closeViewer());
+        top.addView(viewerClose);
+        overlay.addView(top, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+
+        LinearLayout bottom = column();
+        bottom.setPadding(dp(16), dp(12), dp(16), dp(16));
+        bottom.setBackgroundColor(0xCC10161E);
+        viewerInfo = text("", 12, MUTED);
+        bottom.addView(viewerInfo);
+
+        LinearLayout navigation = row();
+        viewerPrev = button("← 上一张", false, v -> navigateViewer(-1));
+        viewerNext = button("下一张 →", false, v -> navigateViewer(1));
+        navigation.addView(viewerPrev, new LinearLayout.LayoutParams(0, dp(44), 1));
+        navigation.addView(viewerNext, new LinearLayout.LayoutParams(0, dp(44), 1));
+        bottom.addView(navigation, spaced(-1, -2, 8));
+
+        LinearLayout actions = row();
+        viewerJpeg = button("JPEG 原图", false, v -> {
+            if (viewerItem != null && viewerItem.jpegAsset() != null) viewerLoadLarge(viewerItem.jpegAsset());
+        });
+        viewerRaw = button("RAW 预览", false, v -> {
+            if (viewerItem != null && viewerItem.rawAsset() != null) viewerLoadLarge(viewerItem.rawAsset());
+        });
+        viewerDownload = button("下载原图", true, v -> {
+            if (viewerItem != null) requestDownload(viewerItem.assets, viewerItem.title());
+        });
+        actions.addView(viewerJpeg, new LinearLayout.LayoutParams(0, dp(48), 1));
+        actions.addView(viewerRaw, new LinearLayout.LayoutParams(0, dp(48), 1));
+        actions.addView(viewerDownload, new LinearLayout.LayoutParams(0, dp(48), 1));
+        bottom.addView(actions, spaced(-1, -2, 10));
+        overlay.addView(bottom, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+
+        overlay.setVisibility(View.GONE);
+        return overlay;
+    }
+
+    private void showViewer(CameraAlbumItem item) {
+        if (item == null) return;
+        viewerItem = item;
+        viewerLargeHandle = -1;
+        viewerOverlay.setVisibility(View.VISIBLE);
+        viewerPreview.setBitmap(item.coverBitmap());
+        updateViewerChrome();
+        if (item.cover() != null && item.coverBitmap() == null) requestThumbnailForItem(item);
+        CameraMediaEntry jpeg = item.jpegAsset();
+        if (jpeg != null) viewerLoadLarge(jpeg);
+    }
+
+    /** Scrolls the viewer to the previous / next photo in the grid. */
+    private void navigateViewer(int delta) {
+        if (viewerItem == null || libraryItems.isEmpty()) return;
+        int current = -1;
+        for (int i = 0; i < libraryItems.size(); i++) {
+            if (libraryItems.get(i).id.equals(viewerItem.id)) { current = i; break; }
+        }
+        int target = (current < 0 ? 0 : current) + delta;
+        if (target < 0 || target >= libraryItems.size()) {
+            Toast.makeText(this, current < 0 ? "当前不在照片列表中" : (delta > 0 ? "已经是最后一张" : "已经是第一张"), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        CameraAlbumItem next = libraryItems.get(target);
+        showViewer(next);
+        viewerPreview.setAlpha(0.35f);
+        viewerPreview.animate().alpha(1f).setDuration(160).start();
+    }
+
+    private void updateViewerChrome() {
+        CameraAlbumItem item = viewerItem;
+        if (item == null) return;
+        int index = -1;
+        for (int i = 0; i < libraryItems.size(); i++) {
+            if (libraryItems.get(i).id.equals(item.id)) { index = i; break; }
+        }
+        viewerTitle.setText(index >= 0 ? item.title() + "  (" + (index + 1) + "/" + libraryItems.size() + ")" : item.title());
+        viewerInfo.setText(item.subtitle() + " · " + item.badge() + " · 上下滑动切换照片");
+        updateViewerButtons();
+    }
+
+    private void closeViewer() {
+        viewerOverlay.setVisibility(View.GONE);
+        viewerItem = null;
+    }
+
+    private void updateViewerButtons() {
+        if (viewerJpeg == null) return;
+        boolean hasItem = viewerItem != null;
+        viewerJpeg.setVisibility(hasItem && viewerItem.hasJpeg() ? View.VISIBLE : View.GONE);
+        viewerRaw.setVisibility(hasItem && viewerItem.hasRaw() ? View.VISIBLE : View.GONE);
+        viewerDownload.setEnabled(hasItem && controller.connected());
+        if (viewerPrev != null) viewerPrev.setEnabled(hasItem && libraryItems.size() > 1);
+        if (viewerNext != null) viewerNext.setEnabled(hasItem && libraryItems.size() > 1);
+    }
+
+    private void viewerLoadLarge(CameraMediaEntry entry) {
+        Size target = new Size(getResources().getDisplayMetrics().widthPixels,
+                getResources().getDisplayMetrics().heightPixels);
+        controller.loadLargePreview(entry, target, new CameraController.MediaPreviewCallback() {
+            @Override public void onStarted(CameraMediaEntry current) {
+                viewerInfo.setText("正在读取 " + current.displayName() + " …");
+            }
+
+            @Override public void onLoaded(CameraMediaEntry current, Bitmap bitmap, String note) {
+                if (viewerItem == null) return;
+                viewerLargeHandle = current.handle;
+                viewerPreview.setBitmap(bitmap);
+                viewerInfo.setText(note + " · " + current.displayName());
+            }
+
+            @Override public void onError(CameraMediaEntry current, String error) {
+                viewerInfo.setText(error);
+                Toast.makeText(getApplicationContext(), error, Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    private void showItemActions(CameraAlbumItem item) {
+        if (item == null) return;
+        boolean selected = selectedAlbumIds.contains(item.id);
+        String[] options = {
+                "下载原图（" + item.assets.size() + " 个文件 · " + CameraMediaEntry.humanBytes(item.totalBytes()) + "）",
+                selected ? "取消选择该组" : "选择该组（用于批量下载）",
+                "查看大图"
+        };
+        new AlertDialog.Builder(this).setTitle(item.title())
+                .setItems(options, (dialog, which) -> {
+                    if (which == 0) requestDownload(item.assets, item.title());
+                    else if (which == 1) {
+                        if (selected) selectedAlbumIds.remove(item.id);
+                        else selectedAlbumIds.add(item.id);
+                        updateLibrarySelectionUi();
+                    } else showViewer(item);
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private void addPropertyRow(LinearLayout parent, int first, String firstLabel, int second, String secondLabel) {
@@ -435,7 +680,7 @@ public final class MainActivity extends Activity implements CameraController.Obs
 
     private void showGuide() {
         new AlertDialog.Builder(this).setTitle("让相机连接到手机")
-                .setMessage("1. 使用支持数据传输的 USB 线和 OTG 转接头。\n\n2. 开启相机，将 USB 模式设置为 PTP / 电脑遥控，关闭相机 Wi‑Fi。\n\n3. 点击「连接相机」，选择设备并允许 USB 访问。\n\n4. 打开「照片库」，可以按日期浏览相机卡内容，JPEG+RAW 会自动配对显示成一组。\n\n5. 点击「查看原图 / RAW 预览」可查看 JPEG 原图或 RAW 内嵌预览，点击下载可保存原文件到手机。\n\n批量下载支持在后台继续进行；缩略图按需懒加载，适合大量照片卡。")
+                .setMessage("1. 使用支持数据传输的 USB 线和 OTG 转接头。\n\n2. 开启相机，将 USB 模式设置为 PTP / 电脑遥控，关闭相机 Wi‑Fi。\n\n3. 点击「连接相机」，选择设备并允许 USB 访问。\n\n4. 打开「照片库」，照片以网格方式边加载边显示，JPEG+RAW 自动配对为一组。\n\n5. 点击任意照片查看大图与原图（支持双指缩放），可切换 RAW 内嵌预览；长按照片可下载原图或加入批量下载。\n\n批量下载支持在后台继续进行；缩略图按需懒加载，适合大量照片卡。")
                 .setPositiveButton("知道了", null).show();
     }
 
@@ -448,7 +693,7 @@ public final class MainActivity extends Activity implements CameraController.Obs
         if (libraryEntries.isEmpty()) refreshLibrary();
         else {
             updateLibraryButtons();
-            prefetchVisibleThumbnails(libraryList.getFirstVisiblePosition(), libraryList.getChildCount());
+            prefetchVisibleThumbnails(libraryGrid.getFirstVisiblePosition(), libraryGrid.getChildCount());
         }
     }
 
@@ -465,10 +710,8 @@ public final class MainActivity extends Activity implements CameraController.Obs
         libraryEntries.clear();
         libraryItems.clear();
         selectedAlbumIds.clear();
-        activeLibraryItem = null;
-        libraryLargePreview = null;
-        libraryLargePreviewHandle = -1;
         pendingThumbnailHandles.clear();
+        failedThumbnailHandles.clear();
         libraryAdapter.replace(Collections.emptyList());
         updateLibrarySelectionUi();
 
@@ -479,27 +722,17 @@ public final class MainActivity extends Activity implements CameraController.Obs
             }
 
             @Override public void onProgress(int loaded, int total) {
-                libraryStatus.setText(total <= 0 ? "相机中没有可识别的图片" : "已读取元数据 " + loaded + " / " + total + "（缩略图将按需加载）");
+                libraryStatus.setText(total <= 0 ? "相机中没有可识别的图片" : "已读取元数据 " + loaded + " / " + total + " · 网格实时填充中");
+            }
+
+            @Override public void onBatch(List<CameraMediaEntry> entries) {
+                applyLibrarySnapshot(entries, false);
             }
 
             @Override public void onLoaded(List<CameraMediaEntry> entries) {
                 libraryRefresh.setEnabled(true);
-                libraryEntries.clear();
-                libraryEntries.addAll(entries);
-                libraryItems.clear();
-                libraryItems.addAll(CameraAlbumItem.mergePairs(entries));
-                libraryAdapter.replace(buildLibraryRows(libraryItems));
-                libraryStatus.setText(libraryItems.isEmpty() ? "未发现可浏览的 JPEG / RAW"
-                        : "已按日期分组，共 " + libraryItems.size() + " 组 / " + libraryEntries.size() + " 个文件");
-                if (!libraryItems.isEmpty()) {
-                    setActiveLibraryItem(libraryItems.get(0), false);
-                    prefetchVisibleThumbnails(0, Math.min(12, libraryAdapter.getCount()));
-                } else {
-                    libraryPreview.setBitmap(null);
-                    libraryPreview.setPlaceholder("未找到相机照片", "请确认存储卡中存在 JPEG / RAW 图片");
-                    libraryMeta.setText("当前照片库为空");
-                }
-                updateLibrarySelectionUi();
+                applyLibrarySnapshot(entries, true);
+                updateLibraryButtons();
             }
 
             @Override public void onError(String error) {
@@ -511,80 +744,62 @@ public final class MainActivity extends Activity implements CameraController.Obs
         });
     }
 
-    private List<LibraryListRow> buildLibraryRows(List<CameraAlbumItem> items) {
-        List<LibraryListRow> rows = new ArrayList<>();
-        String currentHeader = null;
-        int currentCount = 0;
-        int headerIndex = -1;
-        for (CameraAlbumItem item : items) {
-            String header = item.dayTitle();
-            if (!header.equals(currentHeader)) {
-                rows.add(new LibraryListRow.Header(header, 0));
-                headerIndex = rows.size() - 1;
-                currentHeader = header;
-                currentCount = 0;
-            }
-            rows.add(new LibraryListRow.Item(item));
-            currentCount++;
-            rows.set(headerIndex, new LibraryListRow.Header(header, currentCount));
-        }
-        return rows;
+    /** Merge JPEG+RAW pairs off the UI thread, then swap the grid contents atomically. */
+    private void applyLibrarySnapshot(List<CameraMediaEntry> entries, boolean finalBatch) {
+        final int token = ++libraryMergeToken;
+        final List<CameraMediaEntry> snapshot = new ArrayList<>(entries);
+        exports.execute(() -> {
+            final List<CameraAlbumItem> merged = CameraAlbumItem.mergePairs(snapshot);
+            runOnUiThread(() -> {
+                if (token != libraryMergeToken) return;
+                libraryEntries.clear();
+                libraryEntries.addAll(snapshot);
+                libraryItems.clear();
+                libraryItems.addAll(merged);
+                libraryAdapter.replace(libraryItems);
+                if (activeDownloadTask == null) {
+                    libraryStatus.setText(libraryItems.isEmpty()
+                            ? (finalBatch ? "未发现可浏览的 JPEG / RAW" : "正在从相机读取照片元数据…")
+                            : finalBatch
+                            ? "共 " + libraryItems.size() + " 组 / " + libraryEntries.size() + " 个文件 · 点击查看大图，长按下载原图"
+                            : "已加载 " + libraryItems.size() + " 组，持续读取中…");
+                }
+                prefetchVisibleThumbnails(libraryGrid.getFirstVisiblePosition(), libraryGrid.getChildCount());
+                updateLibrarySelectionUi();
+                if (viewerOverlay != null && viewerOverlay.getVisibility() == View.VISIBLE) updateViewerChrome();
+            });
+        });
     }
 
     private void requestThumbnailForItem(CameraAlbumItem item) {
         if (item == null) return;
         CameraMediaEntry cover = item.cover();
-        if (cover == null || cover.thumbnail != null || !pendingThumbnailHandles.add(cover.handle)) return;
+        if (cover == null || cover.thumbnail != null) return;
+        if (failedThumbnailHandles.contains(cover.handle)) return;
+        if (!pendingThumbnailHandles.add(cover.handle)) return;
         controller.loadThumbnail(cover, new CameraController.ThumbnailCallback() {
             @Override public void onLoaded(CameraMediaEntry entry, Bitmap bitmap) {
                 pendingThumbnailHandles.remove(entry.handle);
+                if (bitmap == null) { failedThumbnailHandles.add(entry.handle); return; }
                 libraryAdapter.notifyDataSetChanged();
-                if (activeLibraryItem != null && activeLibraryItem.cover() != null
-                        && activeLibraryItem.cover().handle == entry.handle && libraryLargePreviewHandle != entry.handle) {
-                    libraryPreview.setBitmap(bitmap);
+                if (viewerOverlay.getVisibility() == View.VISIBLE && viewerItem != null && viewerItem.cover() != null
+                        && viewerItem.cover().handle == entry.handle && viewerLargeHandle != entry.handle) {
+                    viewerPreview.setBitmap(bitmap);
                 }
             }
 
             @Override public void onError(CameraMediaEntry entry, String message) {
                 pendingThumbnailHandles.remove(entry.handle);
+                // Remember failures so the grid stops re-requesting files the camera cannot serve.
+                if (entry.thumbnail == null) failedThumbnailHandles.add(entry.handle);
             }
         });
     }
 
     private void prefetchVisibleThumbnails(int firstVisibleItem, int visibleItemCount) {
-        int end = Math.min(libraryAdapter.getCount(), firstVisibleItem + Math.max(visibleItemCount, 0) + 8);
-        for (int position = Math.max(0, firstVisibleItem); position < end; position++) {
-            LibraryListRow row = libraryAdapter.rowAt(position);
-            if (row instanceof LibraryListRow.Item itemRow) requestThumbnailForItem(itemRow.albumItem);
-        }
-    }
-
-    private void setActiveLibraryItem(CameraAlbumItem item, boolean preserveLargePreview) {
-        activeLibraryItem = item;
-        if (item == null) {
-            libraryPreview.setBitmap(null);
-            libraryMeta.setText("未选择照片");
-            libraryAdapter.setActiveId(null);
-            updateLibraryButtons();
-            return;
-        }
-        libraryAdapter.setActiveId(item.id);
-        CameraMediaEntry cover = item.cover();
-        Bitmap previewBitmap = preserveLargePreview && cover != null && libraryLargePreviewHandle == cover.handle ? libraryLargePreview : null;
-        if (previewBitmap == null && cover != null && libraryLargePreviewHandle == cover.handle) previewBitmap = libraryLargePreview;
-        if (previewBitmap == null) previewBitmap = item.coverBitmap();
-        libraryPreview.setBitmap(previewBitmap);
-        updateLibraryMeta(item, item.hasRaw() && item.hasJpeg()
-                ? "这是一组 JPEG + RAW。可分别查看 JPEG 原图或 RAW 内嵌预览，下载时会把两者都保存到手机。"
-                : item.hasRaw() ? "这是一组 RAW 文件。应用内显示内嵌预览，下载后可在专业应用中查看原始数据。"
-                : "这是一组 JPEG 文件。可查看更高质量原图并下载到手机。");
-        if (cover != null && previewBitmap == null) requestThumbnailForItem(item);
-        if (cover != null && libraryLargePreviewHandle != cover.handle && !preserveLargePreview) libraryStatus.setText("已选择 " + item.title());
-        updateLibraryButtons();
-    }
-
-    private void updateLibraryMeta(CameraAlbumItem item, String note) {
-        libraryMeta.setText(item.detailText() + (note == null || note.isEmpty() ? "" : "\n\n提示：" + note));
+        int end = Math.min(libraryAdapter.getCount(), firstVisibleItem + Math.max(visibleItemCount, 0) + 12);
+        for (int position = Math.max(0, firstVisibleItem); position < end; position++)
+            requestThumbnailForItem(libraryAdapter.itemAt(position));
     }
 
     private void updateLibrarySelectionUi() {
@@ -600,15 +815,13 @@ public final class MainActivity extends Activity implements CameraController.Obs
         boolean visible = libraryOverlay != null && libraryOverlay.getVisibility() == View.VISIBLE;
         boolean connected = controller != null && controller.connected();
         boolean hasEntries = !libraryItems.isEmpty();
-        boolean hasActive = activeLibraryItem != null;
         if (libraryRefresh != null) libraryRefresh.setEnabled(connected);
         if (librarySelectAll != null) librarySelectAll.setEnabled(hasEntries);
         if (libraryClear != null) libraryClear.setEnabled(!selectedAlbumIds.isEmpty());
-        if (libraryDownloadCurrent != null) libraryDownloadCurrent.setEnabled(connected && hasActive);
         if (libraryDownloadSelected != null) libraryDownloadSelected.setEnabled(connected && !selectedAlbumIds.isEmpty());
-        if (libraryLoadOriginal != null) libraryLoadOriginal.setEnabled(connected && hasActive);
         if (libraryChooseFolder != null) libraryChooseFolder.setEnabled(visible);
         if (libraryFolder != null) libraryFolder.setText(downloadFolderUri == null ? "下载目录：未选择" : "下载目录：" + folderLabel(downloadFolderUri));
+        updateViewerButtons();
     }
 
     private List<CameraMediaEntry> selectedEntries() {
@@ -618,106 +831,111 @@ public final class MainActivity extends Activity implements CameraController.Obs
         return entries;
     }
 
-    private void promptPreviewChoice() {
-        if (activeLibraryItem == null) return;
-        List<CharSequence> labels = new ArrayList<>();
-        List<CameraMediaEntry> choices = new ArrayList<>();
-        CameraMediaEntry jpeg = activeLibraryItem.jpegAsset();
-        CameraMediaEntry raw = activeLibraryItem.rawAsset();
-        if (jpeg != null) {
-            labels.add("查看 JPEG 原图");
-            choices.add(jpeg);
-        }
-        if (raw != null) {
-            labels.add("查看 RAW 预览");
-            choices.add(raw);
-        }
-        if (choices.isEmpty()) return;
-        if (choices.size() == 1) {
-            loadOriginalPreview(choices.get(0));
-            return;
-        }
-        new AlertDialog.Builder(this).setTitle("选择预览内容")
-                .setItems(labels.toArray(new CharSequence[0]), (dialog, which) -> loadOriginalPreview(choices.get(which)))
-                .setNegativeButton("取消", null).show();
+    private String selectedTitle() {
+        int groups = selectedAlbumIds.size();
+        return groups == 0 ? "已选照片" : "已选 " + groups + " 组";
     }
 
-    private void loadOriginalPreview(CameraMediaEntry entry) {
-        Size target = new Size(Math.max(dp(320), libraryPreview.getWidth()), Math.max(dp(320), libraryPreview.getHeight()));
-        controller.loadLargePreview(entry, target, new CameraController.MediaPreviewCallback() {
-            @Override public void onStarted(CameraMediaEntry current) {
-                libraryStatus.setText("正在读取 " + current.displayName() + " …");
-                libraryLoadOriginal.setEnabled(false);
-            }
-
-            @Override public void onLoaded(CameraMediaEntry current, Bitmap bitmap, String note) {
-                libraryLoadOriginal.setEnabled(true);
-                if (activeLibraryItem == null) return;
-                libraryLargePreview = bitmap;
-                libraryLargePreviewHandle = current.handle;
-                libraryPreview.setBitmap(bitmap);
-                libraryStatus.setText(note);
-                updateLibraryMeta(activeLibraryItem, note + "（当前显示：" + current.displayName() + "）");
-            }
-
-            @Override public void onError(CameraMediaEntry current, String error) {
-                libraryLoadOriginal.setEnabled(true);
-                libraryStatus.setText(error);
-                Toast.makeText(getApplicationContext(), error, Toast.LENGTH_LONG).show();
-            }
-        });
-    }
-
-    private void requestDownload(List<CameraMediaEntry> entries) {
+    /** Enqueues a download job, shows a visible "joined queue" confirmation and starts draining. */
+    private void requestDownload(List<CameraMediaEntry> entries, String title) {
         if (entries == null || entries.isEmpty()) {
             Toast.makeText(this, "请先选择要下载的照片", Toast.LENGTH_SHORT).show();
             return;
         }
         if (downloadFolderUri == null) {
             ArrayList<String> ids = new ArrayList<>();
-            if (activeLibraryItem != null && entries.equals(activeLibraryItem.assets)) ids.add(activeLibraryItem.id);
-            else ids.addAll(selectedAlbumIds);
+            for (CameraAlbumItem item : libraryItems) {
+                for (CameraMediaEntry entry : entries) {
+                    if (item.assets.contains(entry)) { ids.add(item.id); break; }
+                }
+            }
+            pendingDownloadTitle = title;
             pickDownloadFolder(ids);
             return;
         }
-        controller.downloadMedia(downloadFolderUri, entries, new CameraController.DownloadCallback() {
+        String jobTitle = title == null || title.isEmpty() ? (entries.size() + " 个文件") : title;
+        long totalBytes = 0;
+        for (CameraMediaEntry entry : entries) totalBytes += Math.max(0, entry.sizeBytes);
+        DownloadTask task = new DownloadTask("task-" + (++downloadTaskSeq), jobTitle, new ArrayList<>(entries));
+        task.totalBytes = totalBytes;
+        task.fileTotal = entries.size();
+        downloadTasks.add(task);
+        int queuedAhead = 0;
+        for (DownloadTask other : downloadTasks) if (other.state == DownloadTask.State.QUEUED) queuedAhead++;
+        refreshDownloadUi();
+        Toast.makeText(getApplicationContext(), "已加入下载队列：" + jobTitle
+                + (queuedAhead > 1 ? "（前面还有 " + (queuedAhead - 1) + " 个任务）" : ""), Toast.LENGTH_LONG).show();
+        if (libraryStatus != null) libraryStatus.setText("已加入下载队列：" + jobTitle + " · " + CameraMediaEntry.humanBytes(totalBytes));
+        // The in-gallery progress strip is hidden behind the viewer, so surface the queue instead.
+        if (libraryOverlay.getVisibility() != View.VISIBLE) openDownloads();
+        startNextDownload();
+    }
+
+    private void startNextDownload() {
+        if (activeDownloadTask != null) return;
+        DownloadTask task = null;
+        for (DownloadTask candidate : downloadTasks) {
+            if (candidate.state == DownloadTask.State.QUEUED) { task = candidate; break; }
+        }
+        if (task == null) { refreshDownloadUi(); return; }
+        final DownloadTask job = task;
+        activeDownloadTask = job;
+        job.state = DownloadTask.State.RUNNING;
+        refreshDownloadUi();
+        controller.downloadMedia(downloadFolderUri, job.entries, new CameraController.DownloadCallback() {
             @Override public void onStarted(int totalFiles, long totalBytes) {
-                libraryStatus.setText("开始后台下载，共 " + totalFiles + " 个文件 · " + CameraMediaEntry.humanBytes(totalBytes));
-                libraryDownloadCurrent.setEnabled(false);
-                libraryDownloadSelected.setEnabled(false);
+                job.fileTotal = totalFiles;
+                job.totalBytes = Math.max(totalBytes, job.totalBytes);
+                job.stage = "开始传输";
+                refreshDownloadUi();
             }
 
             @Override public void onFileStarted(int index, int totalFiles, String filename, long fileBytes, long totalBytes) {
-                libraryStatus.setText("[" + index + "/" + totalFiles + "] " + filename + " · " + CameraMediaEntry.humanBytes(fileBytes));
+                job.fileIndex = index;
+                job.fileTotal = totalFiles;
+                job.currentFile = filename;
+                job.stage = "读取中";
+                refreshDownloadUi();
             }
 
             @Override public void onFileProgress(int index, int totalFiles, String filename, long fileProgressBytes, long fileBytes,
                                                  long completedBytes, long totalBytes, long bytesPerSecond, String stage) {
-                String speed = bytesPerSecond <= 0 ? "" : " · " + CameraMediaEntry.humanBytes(bytesPerSecond) + "/s";
-                libraryStatus.setText("[" + index + "/" + totalFiles + "] " + filename + " · " + stage + " "
-                        + CameraMediaEntry.humanBytes(fileProgressBytes) + " / " + CameraMediaEntry.humanBytes(fileBytes)
-                        + speed + " · 总计 " + CameraMediaEntry.humanBytes(completedBytes) + " / " + CameraMediaEntry.humanBytes(totalBytes));
+                job.fileIndex = index;
+                job.fileTotal = totalFiles;
+                job.currentFile = filename;
+                job.fileBytes = fileBytes;
+                job.fileProgressBytes = fileProgressBytes;
+                job.completedBytes = completedBytes;
+                job.totalBytes = Math.max(totalBytes, job.totalBytes);
+                job.bytesPerSecond = bytesPerSecond;
+                job.stage = stage;
+                refreshDownloadUi();
             }
 
             @Override public void onCompleted(int successCount, int totalFiles, long totalBytes, List<String> errors) {
-                libraryDownloadCurrent.setEnabled(true);
-                libraryDownloadSelected.setEnabled(true);
-                if (errors.isEmpty()) {
-                    libraryStatus.setText("后台下载完成：成功 " + successCount + " / " + totalFiles + " · " + CameraMediaEntry.humanBytes(totalBytes));
-                    Toast.makeText(getApplicationContext(), "下载完成", Toast.LENGTH_LONG).show();
-                } else {
-                    libraryStatus.setText("下载结束：成功 " + successCount + " / " + totalFiles + "，失败 " + errors.size());
-                    new AlertDialog.Builder(MainActivity.this).setTitle("部分下载失败")
-                            .setMessage(String.join("\n", errors))
-                            .setPositiveButton("知道了", null).show();
+                job.errors.clear();
+                if (errors != null) job.errors.addAll(errors);
+                if (job.state != DownloadTask.State.CANCELLED) {
+                    job.state = errors == null || errors.isEmpty() ? DownloadTask.State.DONE : DownloadTask.State.FAILED;
                 }
+                job.completedBytes = Math.max(totalBytes, job.totalBytes);
+                activeDownloadTask = null;
+                refreshDownloadUi();
+                Toast.makeText(getApplicationContext(),
+                        job.state == DownloadTask.State.DONE ? "下载完成：" + job.title
+                                : job.state == DownloadTask.State.CANCELLED ? "已取消：" + job.title
+                                : "下载结束：" + job.title + "，失败 " + job.errors.size() + " 个文件",
+                        Toast.LENGTH_LONG).show();
+                startNextDownload();
             }
 
-            @Override public void onError(String msg) {
-                libraryDownloadCurrent.setEnabled(true);
-                libraryDownloadSelected.setEnabled(true);
-                libraryStatus.setText(msg);
-                Toast.makeText(getApplicationContext(), msg, Toast.LENGTH_LONG).show();
+            @Override public void onError(String message) {
+                if (job.state != DownloadTask.State.CANCELLED) job.state = DownloadTask.State.FAILED;
+                if (message != null && !message.isEmpty()) job.errors.add(message);
+                activeDownloadTask = null;
+                refreshDownloadUi();
+                Toast.makeText(getApplicationContext(), message, Toast.LENGTH_LONG).show();
+                startNextDownload();
             }
         });
     }
@@ -772,7 +990,9 @@ public final class MainActivity extends Activity implements CameraController.Obs
                 pendingDownloadAlbumIds = null;
                 List<CameraMediaEntry> entries = new ArrayList<>();
                 for (CameraAlbumItem item : libraryItems) if (ids.contains(item.id)) entries.addAll(item.assets);
-                requestDownload(entries);
+                String title = pendingDownloadTitle != null ? pendingDownloadTitle : selectedTitle();
+                pendingDownloadTitle = null;
+                requestDownload(entries, title);
             }
         }
     }
@@ -794,6 +1014,13 @@ public final class MainActivity extends Activity implements CameraController.Obs
     }
 
     @Override protected void onNewIntent(Intent intent) { super.onNewIntent(intent); setIntent(intent); handleUsbIntent(intent); }
+
+    @Override public void onBackPressed() {
+        if (downloadOverlay != null && downloadOverlay.getVisibility() == View.VISIBLE) { downloadOverlay.setVisibility(View.GONE); return; }
+        if (viewerOverlay != null && viewerOverlay.getVisibility() == View.VISIBLE) { closeViewer(); return; }
+        if (libraryOverlay != null && libraryOverlay.getVisibility() == View.VISIBLE) { closeLibrary(); return; }
+        super.onBackPressed();
+    }
     @Override protected void onResume() { super.onResume(); resumed = true; controller.setForeground(true); controller.observe(this); }
 
     @Override protected void onPause() {

@@ -7,7 +7,12 @@ import android.view.*;
 /** Letterboxed preview with image-space focus coordinates and non-destructive review zoom. */
 final class PreviewView extends View {
     interface FocusListener { void onFocus(float x, float y); }
+
+    /** Fired when the user swipes the viewer; true = next photo, false = previous photo. */
+    interface SwipeListener { void onSwipe(boolean next); }
+
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private SwipeListener swipeListener;
     private final RectF imageRect = new RectF();
     private final ScaleGestureDetector scaleDetector;
     private final GestureDetector gestures;
@@ -43,6 +48,20 @@ final class PreviewView extends View {
             @Override public boolean onDoubleTap(MotionEvent e) {
                 zoom = 1f; panX = panY = 0; invalidate(); return true;
             }
+            @Override public boolean onFling(MotionEvent first, MotionEvent current, float velocityX, float velocityY) {
+                if (!review || zoom > 1f || swipeListener == null || first == null || current == null) return false;
+                float dx = current.getX() - first.getX();
+                float dy = current.getY() - first.getY();
+                float minDistance = 48 * getResources().getDisplayMetrics().density;
+                if (Math.abs(dy) > Math.abs(dx)) {
+                    if (Math.abs(dy) < minDistance || Math.abs(velocityY) < 400f) return false;
+                    swipeListener.onSwipe(dy < 0);   // 上滑 → 下一张
+                    return true;
+                }
+                if (Math.abs(dx) < minDistance || Math.abs(velocityX) < 400f) return false;
+                swipeListener.onSwipe(dx < 0);       // 左滑 → 下一张
+                return true;
+            }
             @Override public boolean onScroll(MotionEvent first, MotionEvent current, float dx, float dy) {
                 if (!review || zoom <= 1f || scaleDetector.isInProgress()) return false;
                 panX = Math.max(-getWidth() * (zoom - 1) / 2, Math.min(getWidth() * (zoom - 1) / 2, panX - dx));
@@ -55,6 +74,7 @@ final class PreviewView extends View {
     void setReview(boolean review) { this.review = review; zoom = 1f; panX = panY = 0; }
     void setGrid(boolean grid) { this.grid = grid; invalidate(); }
     void setFocusListener(FocusListener listener) { focus = listener; }
+    void setSwipeListener(SwipeListener listener) { swipeListener = listener; }
     void setPlaceholder(String title, String subtitle) { this.title = title; this.subtitle = subtitle; invalidate(); }
     @Override public boolean performClick() { super.performClick(); return true; }
     @Override public boolean onTouchEvent(MotionEvent event) {
