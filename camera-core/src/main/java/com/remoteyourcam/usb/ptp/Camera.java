@@ -111,8 +111,22 @@ public interface Camera {
         void onImageInfoRetrieved(int objectHandle, ObjectInfo objectInfo, Bitmap thumbnail);
     }
 
+    public interface RetrieveObjectInfoListener {
+        void onObjectInfoRetrieved(int objectHandle, ObjectInfo objectInfo);
+    }
+
     public interface RetrieveImageListener {
         void onImageRetrieved(int objectHandle, Bitmap image);
+    }
+
+    // callbacks aren't on UI thread
+    public interface RetrieveObjectListener {
+        void onObjectRetrieved(int objectHandle, ObjectInfo objectInfo, byte[] data);
+    }
+
+    // callbacks aren't on UI thread
+    public interface TransferProgressListener {
+        void onTransferProgress(int objectHandle, long transferredBytes, long totalBytes);
     }
 
     void setWorkerListener(WorkerListener listener);
@@ -183,7 +197,13 @@ public interface Camera {
 
     void retrieveImageHandles(StorageInfoListener listener, int storageId, int objectFormat);
 
+    void retrieveObjectInfo(RetrieveObjectInfoListener listener, int objectHandle);
+
     void retrieveImageInfo(RetrieveImageInfoListener listener, int objectHandle);
 
     void retrieveImage(RetrieveImageListener listener, int objectHandle);
+
+    void retrieveObject(RetrieveObjectListener listener, int objectHandle);
+
+    void retrieveObject(RetrieveObjectListener listener, int objectHandle, TransferProgressListener progressListener);
 }

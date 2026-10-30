@@ -42,8 +42,11 @@ import com.remoteyourcam.usb.ptp.commands.GetObjectHandlesCommand;
 import com.remoteyourcam.usb.ptp.commands.GetStorageInfosAction;
 import com.remoteyourcam.usb.ptp.commands.InitiateCaptureCommand;
 import com.remoteyourcam.usb.ptp.commands.OpenSessionCommand;
+import com.remoteyourcam.usb.ptp.commands.ProgressCommand;
 import com.remoteyourcam.usb.ptp.commands.RetrieveImageAction;
 import com.remoteyourcam.usb.ptp.commands.RetrieveImageInfoAction;
+import com.remoteyourcam.usb.ptp.commands.RetrieveObjectAction;
+import com.remoteyourcam.usb.ptp.commands.RetrieveObjectInfoAction;
 import com.remoteyourcam.usb.ptp.commands.RetrievePictureAction;
 import com.remoteyourcam.usb.ptp.commands.SetDevicePropValueCommand;
 import com.remoteyourcam.usb.ptp.model.DeviceInfo;
@@ -600,6 +603,7 @@ public abstract class PtpCamera implements Camera {
 
                 int read = res;
                 int length = in.getInt();
+                int packetType = in.getShort() & 0xFFFF;
                 if (length < 12 || length > 64 * 1024 * 1024 || read > length) {
                     onUsbError("Invalid or oversized PTP container: " + length);
                     return;
@@ -607,6 +611,9 @@ public abstract class PtpCamera implements Camera {
                 ByteBuffer infull = null;
 
                 if (read < length) {
+                    if (packetType == PtpConstants.Type.Data && command instanceof ProgressCommand progressCommand) {
+                        progressCommand.onTransferProgress(Math.max(0, read - 12), Math.max(0, length - 12));
+                    }
                     if (length > fullInSize) {
                         fullInSize = length;
                         fullIn = ByteBuffer.allocate(fullInSize);
@@ -628,9 +635,15 @@ public abstract class PtpCamera implements Camera {
                         }
                         infull.put(transferBuffer, 0, count);
                         read += count;
+                        if (packetType == PtpConstants.Type.Data && command instanceof ProgressCommand progressCommand) {
+                            progressCommand.onTransferProgress(Math.max(0, read - 12), Math.max(0, length - 12));
+                        }
                     }
                 } else {
                     infull = in;
+                    if (packetType == PtpConstants.Type.Data && command instanceof ProgressCommand progressCommand) {
+                        progressCommand.onTransferProgress(Math.max(0, read - 12), Math.max(0, length - 12));
+                    }
                 }
 
                 infull.position(0);
@@ -821,8 +834,23 @@ public abstract class PtpCamera implements Camera {
     }
 
     @Override
+    public void retrieveObjectInfo(RetrieveObjectInfoListener listener, int objectHandle) {
+        queue.add(new RetrieveObjectInfoAction(this, listener, objectHandle));
+    }
+
+    @Override
     public void retrieveImage(RetrieveImageListener listener, int objectHandle) {
         queue.add(new RetrieveImageAction(this, listener, objectHandle, pictureSampleSize));
+    }
+
+    @Override
+    public void retrieveObject(RetrieveObjectListener listener, int objectHandle) {
+        queue.add(new RetrieveObjectAction(this, listener, objectHandle));
+    }
+
+    @Override
+    public void retrieveObject(RetrieveObjectListener listener, int objectHandle, TransferProgressListener progressListener) {
+        queue.add(new RetrieveObjectAction(this, listener, objectHandle, progressListener));
     }
 
     @Override
